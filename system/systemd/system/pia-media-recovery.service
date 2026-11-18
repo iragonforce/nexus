@@ -1,0 +1,14 @@
+[Unit]
+Description=Guarded PIA WireGuard and media namespace recovery
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/sbin/pia-media-recover --run
+TimeoutStartSec=900
