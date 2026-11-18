@@ -1,0 +1,11 @@
+# Default deny: only explicitly approved paths are eligible.
+*
+!AGENTS.md
+!.gitignore
+!system/
+!system/modprobe.d/
+!system/modprobe.d/90-nexus-memory-reserve.conf
+!system/modprobe.d/nexus-lockd.conf
+!system/udev/
+!system/udev/rules.d/
+!system/udev/rules.d/81-nexus-gpu-runtime-pm.rules
