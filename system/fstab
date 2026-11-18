@@ -1,0 +1,27 @@
+# /etc/fstab: static file system information.
+#
+# Use 'blkid' to print the universally unique identifier for a
+# device; this may be used with UUID= as a more robust way to name devices
+# that works even if disks are added and removed. See fstab(5).
+#
+# systemd generates mount units based on this file, see systemd.mount(5).
+# Please run 'systemctl daemon-reload' after making changes here.
+#
+# <file system> <mount point>   <type>  <options>       <dump>  <pass>
+# / was on /dev/sda2 during installation
+UUID=fb717058-4506-48be-a540-5135f83ce533 /               ext4    errors=remount-ro 0       1
+# /boot/efi was on /dev/sda1 during installation
+UUID=1F84-9551  /boot/efi       vfat    umask=0077      0       1
+/dev/disk/by-id/ata-Patriot_P210_256GB_P210DDBA2504093106-part3 none swap sw,nofail,x-systemd.device-timeout=10s 0 0
+
+# Docker runtime on fast ZFS zvols, migrated 2026-11-05
+UUID=a25a520c-76a4-4edc-a988-ea988499e291 /mnt/fast/docker-runtime/containerd ext4 noatime,nofail,x-systemd.requires=zfs-mount.service,x-systemd.after=zfs-mount.service,x-systemd.requires=zfs-unlock.service,x-systemd.after=zfs-unlock.service,x-systemd.device-timeout=120s 0 2
+UUID=c36c411d-b55b-4975-8131-a77114bb9a84 /mnt/fast/docker-runtime/docker ext4 noatime,nofail,x-systemd.requires=zfs-mount.service,x-systemd.after=zfs-mount.service,x-systemd.requires=zfs-unlock.service,x-systemd.after=zfs-unlock.service,x-systemd.device-timeout=120s 0 2
+/mnt/fast/docker-runtime/containerd /var/lib/containerd none bind,nofail,x-systemd.requires-mounts-for=/mnt/fast/docker-runtime/containerd 0 0
+/mnt/fast/docker-runtime/docker /var/lib/docker none bind,nofail,x-systemd.requires-mounts-for=/mnt/fast/docker-runtime/docker 0 0
+
+# Samsung T7 external SSD; optional data mount
+UUID=b9cf4384-703b-4100-9692-23dbe3cd3abd /mnt/t7 ext4 noatime,nofail,x-systemd.device-timeout=10s 0 2
+
+# Samsung T7: optional NFS bind mount
+/mnt/t7 /srv/nfs/t7 none bind,nofail,x-systemd.requires-mounts-for=/mnt/t7 0 0
