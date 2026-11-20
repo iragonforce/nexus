@@ -1,0 +1,8 @@
+table inet homelab_cockpit {
+    chain input {
+        type filter hook input priority -40; policy accept;
+        iifname "lo" tcp dport 9090 accept
+        ip saddr 172.16.11.4 ip daddr 172.16.11.1 tcp dport 9090 accept
+        tcp dport 9090 drop
+    }
+}
