@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Purpose: Install, test, or stop a non-production split-view DNS pilot on Nexus.
+# Inputs: action (install|test|stop|status), fixed LAN/Tailscale host addresses below.
+# Output: CoreDNS files in /opt/data/network-alias-dns, port 1053 DNS responses,
+#         and diagnostic logs. Does not modify UDR7, Tailscale, NPM, or port 53.
+# Safety: Existing pilot files are never overwritten; stop preserves all files.
+set -euo pipefail
+BASE=/opt/data/network-alias-dns
+COMPOSE="$BASE/compose.yaml"
+ACTION="${1:-status}"
+LAN_IP=192.168.1.2
+TAIL_IP=100.96.255.81
+
+note() { printf '\n=== %s ===\n' "$*"; }
+require() { command -v "$1" >/dev/null || { echo "Missing: $1" >&2; exit 1; }; }
+compose() { docker compose -f "$COMPOSE" "$@"; }
+
+case "$ACTION" in
+  install)
+    require docker
+    require tailscale
+    [ "$(id -u)" -eq 0 ] || { echo 'Run install with sudo' >&2; exit 1; }
+    [ ! -e "$BASE/Corefile" ] || { echo "Pilot already exists: $BASE (not overwriting)" >&2; exit 1; }
+    note 'Preflight addresses'
+    ip -4 addr show | grep -F "$LAN_IP" >/dev/null || { echo "Nexus LAN IP $LAN_IP not present" >&2; exit 1; }
+    [ "$(tailscale ip -4 | head -1)" = "$TAIL_IP" ] || { echo "Unexpected Nexus Tailscale IP" >&2; exit 1; }
+    if ss -Hlun '( sport = :1053 )' | grep -q . || ss -Hltn '( sport = :1053 )' | grep -q .; then
+      echo 'Port 1053 already occupied' >&2; exit 1
+    fi
+    install -d -m 0755 "$BASE"
+    cat > "$BASE/lan.hosts" <<'EOF'
+192.168.1.2 nexus nexus.home.arpa
+192.168.1.3 tensor tensor.home.arpa
+192.168.1.4 qubit qubit.home.arpa
+EOF
+    cat > "$BASE/tail.hosts" <<'EOF'
+100.96.255.81 nexus nexus.home.arpa
+100.114.178.50 tensor tensor.home.arpa
+100.103.67.56 qubit qubit.home.arpa
+EOF
+    cat > "$BASE/Corefile" <<'EOF'
+.:1053 {
+    bind 192.168.1.2 100.96.255.81
+    view tailnet {
+        expr incidr(client_ip(), '100.64.0.0/10')
+    }
+    errors
+    log
+    hosts /config/tail.hosts {
+        ttl 5
+        fallthrough
+    }
+    forward . 192.168.1.1
+}
+.:1053 {
+    bind 192.168.1.2 100.96.255.81
+    errors
+    log
+    hosts /config/lan.hosts {
+        ttl 5
+        fallthrough
+    }
+    forward . 192.168.1.1
+}
+EOF
+    cat > "$COMPOSE" <<'EOF'
+services:
+  alias-dns-pilot:
+    image: coredns/coredns:1.14.6
+    network_mode: host
+    restart: 'no'
+    command: ['-conf', '/config/Corefile']
+    volumes:
+      - /opt/data/network-alias-dns:/config:ro
+    logging:
+      options:
+        max-size: 5m
+        max-file: '2'
+EOF
+    chmod 0644 "$BASE"/*.hosts "$BASE/Corefile" "$COMPOSE"
+    note 'Validate Compose and start test-only DNS'
+    compose config -q
+    compose up -d
+    sleep 2
+    compose ps
+    ;;
+  test)
+    require dig
+    note 'Local view (expected LAN IPs)'
+    for name in nexus tensor qubit; do
+      dig +time=2 +tries=1 +short @"$LAN_IP" -p 1053 "$name" A
+    done
+    note 'Tailscale view (expected 100.x IPs)'
+    for name in nexus tensor qubit; do
+      dig +time=2 +tries=1 +short @"$TAIL_IP" -p 1053 "$name" A
+    done
+    note 'Note: local self-tests do not prove a remote client source IP'
+    ;;
+  status)
+    [ -f "$COMPOSE" ] && compose ps || echo 'Pilot not installed'
+    [ -f "$COMPOSE" ] && compose logs --tail=30 || true
+    ;;
+  stop)
+    [ -f "$COMPOSE" ] && compose down || echo 'Pilot not installed'
+    ;;
+  *) echo "Usage: $0 {install|test|status|stop}" >&2; exit 2 ;;
+esac

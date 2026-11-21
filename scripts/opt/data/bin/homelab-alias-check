@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Purpose: Compare OS short-name resolution and Nexus pilot DNS views on Qubit/Tensor/Nexus.
+# Inputs: no arguments; optional DNS_LAN and DNS_TAIL environment overrides.
+# Output: read-only DNS, route and TCP probe observations; no network changes.
+set -uo pipefail
+DNS_LAN=${DNS_LAN:-192.168.1.2}
+DNS_TAIL=${DNS_TAIL:-100.96.255.81}
+OS=$(uname -s)
+section() { printf '\n=== %s ===\n' "$*"; }
+
+section 'HOST, ROUTES, TAILSCALE'
+hostname
+tailscale ip -4 2>&1 || true
+tailscale status 2>&1 | head -8 || true
+if [ "$OS" = Darwin ]; then
+  route -n get 192.168.1.3 2>&1 | grep -E 'destination:|gateway:|interface:|flags:' || true
+  route -n get 100.114.178.50 2>&1 | grep -E 'destination:|gateway:|interface:|flags:' || true
+else
+  ip -4 rule show 2>&1 || true
+  ip -4 route get 192.168.1.3 2>&1 || true
+  ip -4 route get 100.114.178.50 2>&1 || true
+fi
+
+section 'OS RESOLVER: SHORT NAMES'
+if command -v python3 >/dev/null; then
+  python3 - <<'PY'
+import socket
+for host in ('nexus','tensor','qubit'):
+    try:
+        results = sorted({x[4][0] for x in socket.getaddrinfo(host, None, socket.AF_INET)})
+        print(f'{host}: {", ".join(results)}')
+    except OSError as e:
+        print(f'{host}: FAILED ({e})')
+PY
+else
+  echo 'python3 not found; cannot test OS resolver'
+fi
+
+section 'PILOT DNS: DIRECT AND TAILSCALE ADDRESSES'
+if command -v dig >/dev/null; then
+  for name in nexus tensor qubit; do
+    printf '%-6s LAN  ' "$name"
+    dig +time=2 +tries=1 +short "@$DNS_LAN" -p 1053 "$name" A 2>&1 | paste -sd, -
+    printf '%-6s TAIL ' "$name"
+    dig +time=2 +tries=1 +short "@$DNS_TAIL" -p 1053 "$name" A 2>&1 | paste -sd, -
+  done
+else
+  echo 'dig not installed'
+fi
+
+section 'TCP SERVICE CONNECTIVITY (PROBE ONLY)'
+if command -v python3 >/dev/null; then
+  python3 - <<'PY'
+import socket
+checks = [('tensor-LAN', '192.168.1.3', 80),
+          ('tensor-TAIL', '100.114.178.50', 80),
+          ('qubit-SMB-LAN', '192.168.1.4', 445),
+          ('qubit-SMB-TAIL', '100.103.67.56', 445),
+          ('qubit-NFS-LAN', '192.168.1.4', 2049),
+          ('qubit-NFS-TAIL', '100.103.67.56', 2049)]
+for label, host, port in checks:
+    try:
+        with socket.create_connection((host, port), timeout=1.5):
+            print(f'{label:16s} {host}:{port}  OPEN')
+    except OSError as e:
+        print(f'{label:16s} {host}:{port}  NO CONNECT ({type(e).__name__})')
+PY
+fi

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Purpose: Switch the LAN-visible "qubit" DNS answer to its Tailscale IP when
+#          Qubit's SSH port is unreachable at home. This affects only the CoreDNS
+#          pilot's lan.hosts file; it does not modify DNS clients or Tailscale.
+# Inputs: dry-run|apply; optional QUBIT_PORT (default 22).
+# Output: printed detection and (apply mode) atomic update to lan.hosts.
+# Safety: Requires pilot files; keeps Nexus and Tensor records unchanged.
+set -euo pipefail
+ROOT=/opt/data/network-alias-dns
+FILE="$ROOT/lan.hosts"
+MODE=${1:-dry-run}
+PORT=${QUBIT_PORT:-22}
+case "$MODE" in dry-run|apply) ;; *) echo 'Use dry-run or apply' >&2; exit 2;; esac
+[ -f "$FILE" ] || { echo "Missing $FILE" >&2; exit 1; }
+
+if python3 - "$PORT" <<'PY'
+import socket,sys
+try:
+    with socket.create_connection(('192.168.1.4',int(sys.argv[1])),timeout=1.5):
+        sys.exit(0)
+except OSError:
+    sys.exit(1)
+PY
+then
+  SELECTED=192.168.1.4
+  STATE=LAN
+else
+  SELECTED=100.103.67.56
+  STATE=TAILSCALE
+fi
+printf 'qubit state=%s selected=%s probe_port=%s\n' "$STATE" "$SELECTED" "$PORT"
+[ "$MODE" = apply ] || exit 0
+
+tmp=$(mktemp "$ROOT/.lan.hosts.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+printf '%s\n' \
+  '192.168.1.2 nexus nexus.home.arpa' \
+  '192.168.1.3 tensor tensor.home.arpa' \
+  "$SELECTED qubit qubit.home.arpa" > "$tmp"
+chmod 0644 "$tmp"
+if cmp -s "$FILE" "$tmp"; then
+  echo 'UNCHANGED'; exit 0
+fi
+cp -p "$FILE" "$ROOT/lan.hosts.previous"
+mv -f "$tmp" "$FILE"
+echo 'UPDATED (previous file saved as lan.hosts.previous)'

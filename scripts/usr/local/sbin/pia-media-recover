@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import fcntl
+import http.client
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE = Path("/srv/containers/data/gluetun-ontario")
+CONFIG = BASE / "wireguard/wg0.conf"
+TOKEN_FILE = Path("/opt/piavpn-manual/token")
+TOKEN_CMD = "/usr/local/sbin/pia-get-token"
+CA_FILE = Path("/etc/pia-media-recovery/ca.rsa.4096.crt")
+
+STATE_DIR = Path("/var/lib/pia-media-recovery")
+STATE_FILE = STATE_DIR / "state.json"
+
+SERVER_HOSTNAME = "Server-12674-0a"
+EXPECTED_IP = "178.93.200.53"
+
+FAILURE_THRESHOLD = 3
+COOLDOWN_SECONDS = 1800
+
+def log(message):
+    print(message, flush=True)
+
+def command(*args, timeout=30):
+    result = subprocess.run(
+        args,
+        text=True,
+        capture_output=True,
+        timeout=timeout
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"{args[0]} failed with exit {result.returncode}"
+        )
+    return result.stdout.strip()
+
+def inspect(name):
+    return json.loads(command("docker", "inspect", name))[0]
+
+def namespace(container):
+    pid = container["State"]["Pid"]
+    if not pid:
+        return None
+    return os.readlink(f"/proc/{pid}/ns/net")
+
+def health():
+    g = inspect("gluetun")
+    return (
+        g["State"].get("Health", {}).get("Status", "unknown"),
+        g
+    )
+
+def load_state():
+    try:
+        state = json.loads(STATE_FILE.read_text())
+        return {
+            "failures": int(state.get("failures", 0)),
+            "last_attempt": int(state.get("last_attempt", 0))
+        }
+    except (OSError, ValueError, TypeError):
+        return {"failures": 0, "last_attempt": 0}
+
+def save_state(state):
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+
+    fd, path = tempfile.mkstemp(dir=STATE_DIR, prefix=".state-")
+    try:
+        with os.fdopen(fd, "w") as file:
+            os.fchmod(file.fileno(), 0o600)
+            json.dump(state, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(path, STATE_FILE)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+def handshake_age(g):
+    try:
+        result = command(
+            "nsenter", "-t", str(g["State"]["Pid"]),
+            "-n", "wg", "show", "tun0",
+            "latest-handshakes",
+            timeout=10
+        )
+        values = [
+            int(line.split()[1])
+            for line in result.splitlines()
+            if len(line.split()) >= 2
+        ]
+        latest = max(values, default=0)
+        return max(0, int(time.time()) - latest) if latest else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+def dependents(g):
+    gid = g["Id"]
+    names = command(
+        "docker", "ps", "--format", "{{.Names}}"
+    ).splitlines()
+
+    result = []
+    for name in names:
+        if name == "gluetun":
+            continue
+
+        container = inspect(name)
+        mode = container["HostConfig"].get("NetworkMode", "")
+
+        if not mode.startswith("container:"):
+            continue
+
+        target = mode.split(":", 1)[1]
+
+        if target == "gluetun" or gid.startswith(target):
+            result.append((name, container))
+
+    return result
+
+def restart_stale(g):
+    target_ns = namespace(g)
+    restarted = []
+
+    for name, container in dependents(g):
+        if namespace(container) == target_ns:
+            continue
+
+        log(f"Stale namespace: {name}")
+
+        timeout = 120 if name == "qbittorrent" else 60
+
+        command(
+            "docker", "restart", "-t",
+            str(timeout), name,
+            timeout=timeout + 45
+        )
+
+        current = inspect(name)
+
+        if namespace(current) != target_ns:
+            raise RuntimeError(
+                f"{name} did not join Gluetun's namespace"
+            )
+
+        restarted.append(name)
+        log(f"Reconnected: {name}")
+
+    return restarted
+
+def get_qbt_preferences():
+    key_path = BASE / "scripts/.qb-api-key"
+    key = key_path.read_text().strip()
+
+    request = urllib.request.Request(
+        "http://172.16.11.45:30200/api/v2/app/preferences",
+        headers={"Authorization": "Bearer " + key}
+    )
+
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({})
+    )
+
+    with opener.open(request, timeout=5) as response:
+        return json.load(response)
+
+def current_forwarded_port(g):
+    path = BASE / "forwarded_port"
+
+    if not path.is_file():
+        return None
+
+    value = path.read_text().strip()
+
+    if not value.isdigit() or not 1 <= int(value) <= 65535:
+        return None
+
+    started = g["State"]["StartedAt"]
+
+    result = command(
+        "docker", "logs",
+        "--since", started,
+        "gluetun",
+        timeout=25
+    )
+
+    # Docker logs usually write application logs to stderr.
+    # Read both streams without printing them.
+    process = subprocess.run(
+        ["docker", "logs", "--since", started, "gluetun"],
+        text=True,
+        capture_output=True,
+        timeout=25
+    )
+
+    logs = process.stdout + process.stderr
+
+    events = [
+        line for line in logs.splitlines()
+        if "[port forwarding]" in line.lower()
+    ]
+
+    matches = [
+        (index, int(match.group(1)))
+        for index, line in enumerate(events)
+        if (match := re.search(
+            r"port forwarded is (\d+)", line, re.I
+        ))
+    ]
+
+    if not matches:
+        return None
+
+    index, confirmed = matches[-1]
+
+    # A subsequent stop, failure, or new startup invalidates
+    # the earlier forwarding confirmation.
+    for line in events[index + 1:]:
+        if re.search(
+            r"\b(stopping|stopped|disabled|failed|starting)\b",
+            line, re.I
+        ):
+            return None
+
+    return confirmed if confirmed == int(value) else None
+
+def ensure_qbt_binding(g):
+    q = inspect("qbittorrent")
+
+    if namespace(q) != namespace(g):
+        log("qBittorrent namespace mismatch; skipping port update")
+        return False
+
+    port = current_forwarded_port(g)
+
+    if not port:
+        log("Active PIA forwarding lease not verified; skipping")
+        return False
+
+    prefs = None
+
+    for _ in range(30):
+        try:
+            prefs = get_qbt_preferences()
+            break
+        except Exception:
+            time.sleep(5)
+
+    if prefs is None:
+        log("qBittorrent API unavailable; leaving settings unchanged")
+        return False
+
+    if (
+        prefs.get("current_network_interface") == "tun0"
+        and prefs.get("listen_port") == port
+        and prefs.get("random_port") is False
+    ):
+        log(f"qBittorrent binding: tun0:{port} (correct)")
+        return True
+
+    log("Restoring authenticated qBittorrent forwarding hook")
+
+    command(
+        "docker", "exec", "gluetun",
+        "/bin/sh", "/gluetun/scripts/qb-up.sh",
+        str(port), "tun0",
+        timeout=90
+    )
+
+    updated = get_qbt_preferences()
+
+    if not (
+        updated.get("current_network_interface") == "tun0"
+        and updated.get("listen_port") == port
+        and updated.get("random_port") is False
+    ):
+        raise RuntimeError("qBittorrent binding verification failed")
+
+    log(f"qBittorrent binding restored: tun0:{port}")
+    return True
+
+def config_field(config, name):
+    found = re.findall(
+        rf"(?m)^\s*{re.escape(name)}\s*=\s*(\S+)",
+        config
+    )
+    if len(found) != 1:
+        raise RuntimeError(f"Invalid WireGuard field: {name}")
+    return found[0]
+
+def register_pia():
+    original = CONFIG.read_text()
+
+    endpoint = config_field(original, "Endpoint")
+    server_ip, port_text = endpoint.rsplit(":", 1)
+
+    if server_ip != EXPECTED_IP:
+        raise RuntimeError("Endpoint changed; manual review required")
+
+    server_port = int(port_text)
+
+    public_key = subprocess.run(
+        ["wg", "pubkey"],
+        input=config_field(original, "PrivateKey") + "\n",
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10
+    ).stdout.strip()
+
+    log("Requesting fresh PIA authentication token")
+
+    # Never print command output, tokens, or URLs containing tokens.
+    subprocess.run(
+        [TOKEN_CMD],
+        cwd="/root",
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=45
+    )
+
+    os.chmod(TOKEN_FILE, 0o600)
+    token = TOKEN_FILE.read_text().splitlines()[0].strip()
+
+    if not token:
+        raise RuntimeError("PIA token unavailable")
+
+    context = ssl.create_default_context(
+        cadata=CA_FILE.read_text()
+    )
+    context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+
+    class PIAConnection(http.client.HTTPSConnection):
+        def connect(self):
+            raw = socket.create_connection(
+                (server_ip, server_port), timeout=15
+            )
+            self.sock = self._context.wrap_socket(
+                raw, server_hostname=self.host
+            )
+
+    connection = PIAConnection(
+        SERVER_HOSTNAME, server_port,
+        context=context, timeout=15
+    )
+
+    query = urllib.parse.urlencode({
+        "pt": token,
+        "pubkey": public_key
+    })
+
+    try:
+        connection.request("GET", "/addKey?" + query)
+        response = connection.getresponse()
+        status = response.status
+        data = json.loads(response.read(65536))
+    finally:
+        connection.close()
+        token = None
+
+    if status != 200 or data.get("status") != "OK":
+        raise RuntimeError("PIA WireGuard registration rejected")
+
+    address = str(data["peer_ip"])
+    server_key = str(data["server_key"])
+    new_port = int(data["server_port"])
+
+    ipaddress.ip_interface(
+        address if "/" in address else address + "/32"
+    )
+
+    if len(base64.b64decode(server_key, validate=True)) != 32:
+        raise RuntimeError("Invalid PIA server public key")
+
+    if not 1 <= new_port <= 65535:
+        raise RuntimeError("Invalid PIA server port")
+
+    changes = {
+        "Address": address,
+        "PublicKey": server_key,
+        "Endpoint": f"{server_ip}:{new_port}"
+    }
+
+    updated = original
+
+    for name, value in changes.items():
+        pattern = re.compile(
+            rf"(?m)^(\s*{re.escape(name)}\s*=\s*).*$"
+        )
+
+        updated, count = pattern.subn(
+            lambda match, v=value: match.group(1) + v,
+            updated
+        )
+
+        if count != 1:
+            raise RuntimeError(f"Cannot safely update {name}")
+
+    if updated == original:
+        log("PIA registration accepted; configuration unchanged")
+        return False
+
+    stamp = datetime.now(timezone.utc).strftime(
+        "%Y%m%d-%H%M%S"
+    )
+
+    backup = CONFIG.with_name(
+        f"wg0.conf.before-auto-refresh-{stamp}"
+    )
+
+    if backup.exists():
+        raise RuntimeError("Backup already exists")
+
+    shutil.copy2(CONFIG, backup)
+    os.chmod(backup, 0o600)
+
+    stat = CONFIG.stat()
+    fd, temporary = tempfile.mkstemp(
+        dir=CONFIG.parent, prefix=".wg0-auto-"
+    )
+
+    try:
+        with os.fdopen(fd, "w") as file:
+            os.fchmod(file.fileno(), 0o600)
+            os.fchown(file.fileno(), stat.st_uid, stat.st_gid)
+            file.write(updated)
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(temporary, CONFIG)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+    log(f"WireGuard backup: {backup}")
+    log("Tunnel parameters updated; private key preserved")
+    return True
+
+def wait_for_vpn():
+    for _ in range(30):
+        status, g = health()
+
+        if status == "healthy":
+            age = handshake_age(g)
+
+            if age is not None and age < 180:
+                return g
+
+        time.sleep(5)
+
+    raise RuntimeError("VPN did not recover after restart")
+
+def run_once():
+    status, g = health()
+    state = load_state()
+
+    log(f"Gluetun health: {status}")
+
+    age = handshake_age(g)
+    log(
+        "WireGuard handshake age: "
+        + (f"{age}s" if age is not None else "unavailable")
+    )
+
+    if status == "healthy":
+        if state["failures"]:
+            state["failures"] = 0
+            save_state(state)
+
+        restarted = restart_stale(g)
+
+        if restarted:
+            log("Restarted stale containers: " + ", ".join(restarted))
+            ensure_qbt_binding(g)
+        else:
+            # A normal healthy check is non-disruptive.
+            log("Container namespaces: already synchronized")
+
+        return
+
+    if g["State"]["Status"] != "running":
+        log("Gluetun is not running; manual intervention required")
+        return
+
+    state["failures"] += 1
+    save_state(state)
+
+    log(
+        f"Consecutive failed checks: "
+        f"{state['failures']}/{FAILURE_THRESHOLD}"
+    )
+
+    if state["failures"] < FAILURE_THRESHOLD:
+        return
+
+    elapsed = int(time.time()) - state["last_attempt"]
+
+    if elapsed < COOLDOWN_SECONDS:
+        log("Recovery cooldown active")
+        return
+
+    # Avoid rotating an already recovered connection.
+    current_status, _ = health()
+    if current_status == "healthy":
+        state["failures"] = 0
+        save_state(state)
+        return
+
+    state["last_attempt"] = int(time.time())
+    save_state(state)
+
+    log("Initiating PIA recovery")
+
+    register_pia()
+
+    command(
+        "docker", "restart", "-t", "30", "gluetun",
+        timeout=75
+    )
+
+    recovered = wait_for_vpn()
+
+    log("VPN recovery: HEALTHY")
+
+    restarted = restart_stale(recovered)
+
+    if restarted:
+        log("Reconnected: " + ", ".join(restarted))
+
+    ensure_qbt_binding(recovered)
+
+    state["failures"] = 0
+    save_state(state)
+    log("Recovery completed")
+
+def check_only():
+    status, g = health()
+
+    log(f"Gluetun health: {status}")
+
+    age = handshake_age(g)
+    log(
+        "WireGuard handshake age: "
+        + (f"{age}s" if age is not None else "unavailable")
+    )
+
+    target_ns = namespace(g)
+    stale = []
+
+    for name, container in dependents(g):
+        if namespace(container) != target_ns:
+            stale.append(name)
+
+    log("Running VPN dependents: " + str(len(dependents(g))))
+    log("Stale namespaces: " + (
+        ", ".join(stale) if stale else "none"
+    ))
+
+    try:
+        prefs = get_qbt_preferences()
+        log("qBittorrent interface: " +
+            str(prefs.get("current_network_interface")))
+        log("qBittorrent listening port: " +
+            str(prefs.get("listen_port")))
+        log("Authentication bypasses disabled: " + str(
+            prefs.get("bypass_local_auth") is False
+            and prefs.get("bypass_auth_subnet_whitelist_enabled") is False
+        ))
+    except Exception:
+        log("qBittorrent API: unavailable")
+
+    state = load_state()
+    log("Recorded consecutive failures: " + str(state["failures"]))
+    log("Configuration changes: NONE")
+
+def main():
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--check", action="store_true")
+    group.add_argument("--run", action="store_true")
+    args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        raise RuntimeError("Root privileges required")
+
+    # Prevent overlapping timer and manual invocations.
+    with open("/run/lock/pia-media-recovery.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        if args.check:
+            check_only()
+        else:
+            run_once()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        # Do not print exception details that might contain API tokens.
+        log("ERROR: " + type(exc).__name__)
+        sys.exit(1)
