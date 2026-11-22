@@ -271,3 +271,6 @@
 !scripts/usr/local/libexec/tim-hortons-email-audit.py
 !scripts/usr/local/sbin/hermes-docker-report
 !scripts/usr/local/sbin/pia-media-recover
+!.github/
+!.github/workflows/
+!.github/workflows/gitleaks.yml
